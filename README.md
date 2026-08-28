@@ -1,8 +1,6 @@
 # DudeSrc
 UnrealScript mod for Postal 2
 
-Currently, the mod is still under heavy development. Stay tuned.
-
 # Compiling
 
 The project requires you to have POSTed SDK installed. Create a new folder called "GoldSrcMovement" and drop in the repo's contents to the root of the SDK.
