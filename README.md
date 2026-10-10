@@ -21,7 +21,7 @@ Console=GoldSrcMovement.GoldSrcConsole
 ServerActors=GoldSrcMovement.GoldSrcInjector
 ```
 
-## Paradise Lost
+## Paradise Lost (DS 1.3)
 
 Paradise Lost is a separate install with its own System folder, but it already
 looks in the main game's System folder for packages (ParadiseLost.ini `Paths`
@@ -48,17 +48,7 @@ those at Login. Paradise Lost ships `PLGame.PLGameInfo` instead of the base
 game's `AWPGameInfo`, so the mod names it (and `TWPGameInfo` / `CreditsGameInfo`)
 by string at runtime rather than referencing a class the SDK does not have.
 
-# Console commands
-
-```ini
-dudesrc_quakerockets [0/1]   ; your own rockets/explosions stop damaging you but still launch you
-dudesrc_quakegun [0/1]       ; Quake rocket launcher: instant straight rocket instead of P2's charged one
-sv_rocketjumpboost <mult>    ; extra launch on your OWN blasts (default 1.35, 1.0 = off)
-speedox <pixels>             ; slide the speedometer left/right (0 = stock position)
-speedoy <pixels>             ; slide the speedometer up/down (0 = stock position)
-```
-
-## Rocket launcher
+## Rocket launcher (DS 1.3)
 
 By default the rocket launcher is the Quake one: a tap fires a single fast, dead
 straight rocket, with no charging and no seeking rocket. This is on by default and
