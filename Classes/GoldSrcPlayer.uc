@@ -8,7 +8,10 @@ class GoldSrcPlayer extends AWDudePlayer
 var GoldSrcMovement Move;           // The movement simulation
 
 var config bool bGoldSrcMovement;   // Master enable
+var config bool bEdgebugMode;      // sv_edgebugmode -- gates the edgebug bind
 var config bool bShowSpeedometer;
+var config float SpeedoOffX;            // speedox -- speedometer X offset, screen pixels
+var config float SpeedoOffY;            // speedoy -- speedometer Y offset, screen pixels
 var config bool bShowMoveDebug;
 var config bool bShowNetGraph;       // net_graph 1  (GoldSrcHUD.DrawNetGraph)
 var config bool bShowPos;            // cl_showpos 1 (GoldSrcHUD.DrawShowPos)
@@ -28,6 +31,19 @@ var config bool  bViewModelSwayPitch; // cl_swaypitch -- sv_viewmodel_lag_do_ang
 
 // The crackola's second gun, permanently, with no bottle to drink.
 var config bool bForceDualWield;      // cl_forcedualwield 1
+
+// Quake-rocket jumping: the player's own explosions stop hurting them but still
+// push them. Enforced by GoldSrcRocketRules (zero self-damage) plus the self-hit
+// branch in DriveDamage (which turns the would-be rocket jump into real motion).
+var config bool bQuakeRockets;        // dudesrc_quakerockets 1
+var GoldSrcRocketRules RocketRules;   // our slot in Level.Game.GameRulesModifiers
+
+// Quake-style rocket launcher: a tap instead of a charge, a fast straight rocket,
+// and (via GoldSrcRocketLauncher) the toggle that puts it back. Turning this on
+// also converts any stock launcher the player already carries -- see
+// ConvertStockLauncher. Off restores the game's charged, seeking launcher.
+var config bool bQuakeGun;            // dudesrc_quakegun 1
+var float NextLauncherSweep;          // throttles the launcher sweep in PlayerTick
 
 // Strafe roll: the camera banking into a sideways move. The angle is degrees at
 // full lean and the speed is how fast (HL units) you have to be sliding sideways
@@ -200,6 +216,17 @@ var int  DuckTapKeyInFlight;// key whose press is being processed (console sets)
 var float DuckTapKeyInFlightTime;   // when, so only this frame's key counts
 var float DuckTapExecTime;  // when the exec last ran with no key published
 
+// Edgebug bind ("EBv1", mint's +mint_edgebug). Hold semantics are the ducktap
+// arrangement all over again: the exec publishes a hold, GoldSrcConsole names
+// the key that owns it, and its release retires it. sv_edgebugmode is the
+// master gate; the bind does nothing with it off.
+var bool bEdgebugHeld;      // edgebug key held, reported by GoldSrcConsole
+var int  EdgebugHoldKey;    // the raw key whose release ends that hold
+var int  EdgebugKeyInFlight;// key whose press is being processed (console sets)
+var float EdgebugKeyInFlightTime;  // when, so only this frame's key counts
+var float EdgebugExecTime;  // when the exec last ran with no key published
+var float EdgebugDebugMsgTime;     // throttle for the sv_edgebug_debug readout
+
 // Footsteps.
 var float FootStepAccum;    // mirrors AWDude.LastFootstepTime
 var bool  bWasOnGround;     // landing edge detection
@@ -254,6 +281,110 @@ final function DuckTapHoldEnd()
 	DuckTapHoldKey = 0;
 }
 
+// Edgebug bind, bound as a plain exec (sv_edgebugmode gates it):
+//     set input V edgebug
+//     set input X sv_edgebugmode      (toggle, or sv_edgebugmode 1/0)
+// Hold semantics are the ducktap pair: the console names the key that owns the
+// hold and retires it on release.
+exec function edgebug()
+{
+	// The console names the key that owns this hold; adopt it when its press
+	// is the one we are processing (see GoldSrcConsole).
+	if (EdgebugKeyInFlight != 0 && EdgebugKeyInFlightTime == Level.TimeSeconds)
+		EdgebugHoldKey = EdgebugKeyInFlight;
+
+	// Self-sufficient latch: the hold starts here even if the console never
+	// delivers a key event for it. Repeats, where the engine sends them, just
+	// refresh it -- but the hold no longer DEPENDS on them: once a key is
+	// adopted the release event is the only thing that ends it (see the
+	// retirement logic in PlayerMove).
+	EdgebugExecTime = Level.TimeSeconds;
+	bEdgebugHeld    = true;
+}
+
+// Called by GoldSrcConsole on the release of the key that claimed the hold, and
+// wherever a held key can no longer be trusted to deliver one (typing, level
+// change, a new pawn).
+final function EdgebugHoldEnd()
+{
+	bEdgebugHeld   = false;
+	EdgebugHoldKey = 0;
+}
+
+// Edgebug master switch. The bind is a no-op with it off, so the key can stay
+// bound and do nothing until it is wanted.
+exec function sv_edgebugmode(optional string OnOff)
+{
+	if (OnOff == "1" || OnOff ~= "on")       bEdgebugMode = true;
+	else if (OnOff == "0" || OnOff ~= "off") bEdgebugMode = false;
+	else                                     bEdgebugMode = !bEdgebugMode;
+
+	if (bEdgebugMode)
+		ClientMessage("You have enabled an experimental feature. The edgebug feature"
+			@ "will get gradually updated with more updates to DudeSrc. The feature"
+			@ "currently doesnt have 100% accurate edgebugs like in mint (HL2), some"
+			@ "edges are just not edgebuggble for now, to be fixed in EBv2. You can"
+			@ "press/hold the edgebug bind, set your edgebug bind with 'set input"
+			@ "(key) edgebug' Have fun!");
+	else
+		ClientMessage("Edgebug mode: OFF");
+}
+
+// Edgebug hunt diagnostics: prints what the assist sees every frame while the
+// bind is held. "no floor in lookahead" means detection never even had a
+// candidate; "scan: all open" means the probes found nothing (too high?);
+// "scan: full floor" means we are over plain ground, not an edge.
+exec function sv_edgebug_debug(optional string OnOff)
+{
+	if (Move == None)
+		return;
+
+	if (OnOff == "1" || OnOff ~= "on")       Move.bEdgebugDebug = true;
+	else if (OnOff == "0" || OnOff ~= "off") Move.bEdgebugDebug = false;
+	else                                     Move.bEdgebugDebug = !Move.bEdgebugDebug;
+
+	if (Move.bEdgebugDebug)
+		ClientMessage("Edgebug debug: ON");
+	else
+		ClientMessage("Edgebug debug: OFF");
+}
+
+// Source-style noclip toggle: fly along the view direction, no collision, no
+// gravity. While it is on the movement frame is PM_NoclipMove and nothing else.
+exec function noclip()
+{
+	if (Move == None)
+		return;
+
+	Move.bNoclip = !Move.bNoclip;
+
+	// Leaving noclip mid-air resumes the fall from a clean state, not from a
+	// speed the fly never had.
+	if (!Move.bNoclip)
+		Move.velocity = vect(0,0,0);
+
+	if (Move.bNoclip)
+		ClientMessage("noclip ON");
+	else
+		ClientMessage("noclip OFF");
+}
+
+// sv_noclipspeed, in HL units like every other speed dial here.
+exec function sv_noclipspeed(optional string Value)
+{
+	if (Move == None)
+		return;
+
+	if (Value != "")
+	{
+		Move.sv_noclipspeed = FMax(1.0, float(Value)) * Move.WorldScale;
+		Move.SaveConfig();
+	}
+
+	ClientMessage("sv_noclipspeed" @ int(Move.sv_noclipspeed / Move.WorldScale + 0.5)
+		@ "(HL units; default 1000)");
+}
+
 // Setup
 function PostBeginPlay()
 {
@@ -261,6 +392,8 @@ function PostBeginPlay()
 
 	if (Move == None)
 		Move = new(Self) class'GoldSrcMovement';
+
+	EnsureRocketRules();
 }
 
 function Possess(Pawn aPawn)
@@ -270,13 +403,25 @@ function Possess(Pawn aPawn)
 	if (Move == None)
 		Move = new(Self) class'GoldSrcMovement';
 
+	EnsureRocketRules();
+
 	// Whatever the input state was before this pawn (level travel, respawn), the
 	// ducktap key is not being held right now.
 	DuckTapHoldEnd();
 
 	DuckTapKeyInFlight = 0;
 
+	// Same for the edgebug hold.
+	EdgebugHoldEnd();
+
+	EdgebugKeyInFlight = 0;
+
 	bMoveInitialized = false;
+
+	// A fresh pawn: run the launcher sweep right away rather than waiting out the
+	// throttle. (The loadout may land a moment later, so PlayerTick keeps at it.)
+	NextLauncherSweep = 0.0;
+	ConvertStockLauncher();
 
 	// bCheatDualWield is not travel tagged, so a level change drops it while the
 	// config flag survives. Only reassert it when we are forcing, so a level begun
@@ -801,7 +946,10 @@ final function ApplyMoveState()
 	// SetLocation is a teleport AND it can FAIL: it returns false and moves nothing
 	// when the destination encroaches geometry. Ignoring that return is what wedges
 	// the player -- the sim keeps integrating from an origin the pawn never reached.
-	if (Move.origin != Pawn.Location && !MovePawnTo(Move.origin))
+	// Noclip is the one caller that WANTS to encroach: no collision is the point, so
+	// it moves with encroachment ignored rather than being refused by walls.
+	if (Move.origin != Pawn.Location
+		&& !MovePawnTo(Move.origin, Move.bNoclip))
 		SalvageRefusedMove();
 
 	Pawn.Velocity     = Move.velocity;
@@ -1118,7 +1266,7 @@ final function RestoreStockEyeHeight(optional bool bCrouched)
 // Damage reaches the simulation through here and nowhere else.
 function NotifyTakeHit(pawn InstigatedBy, vector HitLocation, int Damage, class<DamageType> damageType, vector Momentum)
 {
-	DriveDamage(Damage, damageType, Momentum);
+	DriveDamage(Damage, damageType, Momentum, InstigatedBy);
 
 	NotifyDamageDirection(InstigatedBy, HitLocation, Momentum);
 
@@ -1165,10 +1313,11 @@ final function NotifyDamageDirection(pawn InstigatedBy, vector HitLocation, vect
 // Our own damage driver: every effect a hit is allowed to have on the movement
 // simulation happens here, in this order, and the stock damage path gets no
 // other say.
-final function DriveDamage(int Damage, class<DamageType> damageType, vector Momentum)
+final function DriveDamage(int Damage, class<DamageType> damageType, vector Momentum, pawn InstigatedBy)
 {
 	local vector Kick, PreVel;
 	local bool   bExplosive;
+	local bool   bQuakeSelf;
 
 	if (!bGoldSrcMovement || Pawn == None || Move == None || !bMoveInitialized)
 		return;
@@ -1184,11 +1333,28 @@ final function DriveDamage(int Damage, class<DamageType> damageType, vector Mome
 
 	bExplosive = ClassIsChildOf(damageType, class'BaseFX.ExplodedDamage');
 
+	// A quake-rocket self-hit. GoldSrcRocketRules has already zeroed the damage,
+	// so this arrives with a NEGATED value (P2Pawn.uc:2364 reports a would-be hit
+	// that did nothing as -StartDamage). We still want the throw, so treat it as a
+	// full-strength explosion and let the simulation carry the launch.
+	bQuakeSelf = bQuakeRockets
+		&& InstigatedBy != None
+		&& InstigatedBy == Pawn
+		&& bExplosive;
+
 	// The pre-hit truth, sampled after the reclaim so it is the value the next
 	// simulation frame would actually have started from.
 	PreVel = Move.velocity;
 
-	Kick = BudgetDamagePush(DamageKnockback(Damage, damageType, Momentum));
+	Kick = DamageKnockback(Damage, damageType, Momentum, bQuakeSelf);
+
+	// A blast the player set off themselves -- rocket or grenade -- throws them a
+	// little harder, so self-blast jumps go higher. The boost lands BEFORE the
+	// budget so the frame cap stays uniform whatever else hit this frame.
+	if (bExplosive && InstigatedBy != None && InstigatedBy == Pawn)
+		Kick *= Move.sv_rocketjumpboost;
+
+	Kick = BudgetDamagePush(Kick);
 
 	Move.velocity += Kick;
 
@@ -1287,12 +1453,16 @@ final function vector BudgetDamagePush(vector Kick)
 }
 
 // The velocity a hit should actually add, reconstructed the way the PAWN got it.
-final function vector DamageKnockback(int Damage, class<DamageType> damageType, vector Momentum)
+final function vector DamageKnockback(int Damage, class<DamageType> damageType, vector Momentum, optional bool bForceExplosive)
 {
 	// Hits that did no damage never reached AddVelocity: P2Pawn.uc:2364 reports
 	// them with the damage negated and returns before the push. Do not push
 	// either, or armour and god mode would still shove the player around.
-	if (Damage <= 0)
+	//
+	// The exception is a quake-rocket self-hit (bForceExplosive): there the zero
+	// damage is our own doing, the throw is the entire point of the toggle, and the
+	// momentum P2 handed us is the full blast, so it is pushed regardless.
+	if (Damage <= 0 && !bForceExplosive)
 		return vect(0,0,0);
 
 	// Explosives keep their boost, scaled by sv_explosionknockback. sv_knockback
@@ -1306,6 +1476,8 @@ final function vector DamageKnockback(int Damage, class<DamageType> damageType, 
 		return Momentum;
 	}
 
+	// bForceExplosive is only ever set for an explosive type, so anything reaching
+	// here is a real, positive-damage hit.
 	if (ClassIsChildOf(damageType, class'BaseFX.BulletDamage'))
 		Momentum *= BULLET_DAMP_MEAN;
 
@@ -1341,6 +1513,234 @@ exec function sv_usep2hull(optional string OnOff)
 		ClientMessage("Hull: POSTAL 2 size");
 	else
 		ClientMessage("Hull: Half-Life size");
+}
+
+// sv_rocketjumpboost: how much harder your OWN blast throws you, on top of the
+// ordinary explosion knockback. 1.0 turns it off. Enemy blasts never see it.
+exec function sv_rocketjumpboost(optional string Amount)
+{
+	local float V;
+
+	if (Move == None)
+		return;
+
+	if (Amount == "")
+	{
+		ClientMessage("sv_rocketjumpboost:" @ Move.sv_rocketjumpboost @ "(your own blast jump boost)");
+		return;
+	}
+
+	V = float(Amount);
+	if (V <= 0.0)
+	{
+		ClientMessage("sv_rocketjumpboost: give a positive number (1.0 = off)");
+		return;
+	}
+
+	Move.sv_rocketjumpboost = V;
+	Move.SaveConfig();
+	ClientMessage("sv_rocketjumpboost:" @ Move.sv_rocketjumpboost);
+}
+
+// dudesrc_quakerockets: the player's own explosions stop damaging them but still
+// throw them -- Quake rocket jumps. The damage side is zeroed by our GameRules
+// entry (GoldSrcRocketRules); the throw is driven here in DriveDamage, because
+// zero damage is also the case P2 reports as "you would have been hurt".
+exec function dudesrc_quakerockets(optional string OnOff)
+{
+	if (OnOff == "1" || OnOff ~= "on")       bQuakeRockets = true;
+	else if (OnOff == "0" || OnOff ~= "off") bQuakeRockets = false;
+	else                                     bQuakeRockets = !bQuakeRockets;
+
+	EnsureRocketRules();
+	SaveConfig();
+
+	if (bQuakeRockets)
+		ClientMessage("Quake rockets: ON -- your own rockets and explosions no longer hurt you, but still launch you.");
+	else
+		ClientMessage("Quake rockets: OFF");
+}
+
+// Make sure our GameRules entry is in the level's chain. Safe to call every time
+// we take over a pawn: it only spawns one if the level does not already have it,
+// and the rules read the live flag off the player, so nothing needs syncing.
+final function EnsureRocketRules()
+{
+	local GameRules R;
+
+	if (Level == None || Level.Game == None)
+		return;
+
+	// Walk the chain first -- a level travel builds a fresh GameInfo, but a
+	// respawn or a possession does not, and we only want one entry.
+	for (R = Level.Game.GameRulesModifiers; R != None; R = R.NextGameRules)
+	{
+		if (GoldSrcRocketRules(R) != None)
+		{
+			RocketRules = GoldSrcRocketRules(R);
+			return;
+		}
+	}
+
+	RocketRules = Spawn(class'GoldSrcRocketRules');
+
+	if (RocketRules == None)
+		return;
+
+	if (Level.Game.GameRulesModifiers == None)
+		Level.Game.GameRulesModifiers = RocketRules;
+	else
+		Level.Game.GameRulesModifiers.AddGameRules(RocketRules);
+}
+
+// dudesrc_quakegun: swap POSTAL 2's charged, seeking rocket launcher for the
+// Quake one -- tap to fire, a fast straight rocket. The weapon class itself reads
+// this flag (GoldSrcRocketLauncher.QuakeGunOn) so the switch is instant and needs
+// no class swap at runtime.
+exec function dudesrc_quakegun(optional string OnOff)
+{
+	if (OnOff == "1" || OnOff ~= "on")       bQuakeGun = true;
+	else if (OnOff == "0" || OnOff ~= "off") bQuakeGun = false;
+	else                                     bQuakeGun = !bQuakeGun;
+
+	SaveConfig();
+
+	// Let the sweep run on the next tick rather than waiting out its throttle.
+	NextLauncherSweep = 0.0;
+
+	if (bQuakeGun)
+		ClientMessage("Quake launcher: ON -- the rocket launcher fires instantly and straight; any launcher you carry is converted.");
+	else
+		ClientMessage("Quake launcher: OFF -- back to the charged, seeking rocket launcher.");
+}
+
+// Give the player the Quake launcher in place of a stock one they already own. A
+// day loadout or a cheat grants the exact class 'LauncherWeapon', which the
+// LauncherPickup default patch (GoldSrcConsole) cannot reach, so the swap has to
+// happen here. FindInventoryType is an EXACT class test (Engine/Pawn.uc:878), so
+// this only ever sees the vanilla weapon -- never the subclass, and never the
+// MP LauncherWeaponSS -- which also means the sweep is a no-op once converted.
+final function ConvertStockLauncher()
+{
+	local LauncherWeapon Old;
+	local GoldSrcRocketLauncher Fresh;
+
+	if (!bQuakeGun || Pawn == None)
+		return;
+
+	Old = LauncherWeapon(Pawn.FindInventoryType(class'LauncherWeapon'));
+	if (Old == None || Old.Class != class'LauncherWeapon')
+		return;
+
+	Fresh = Spawn(class'GoldSrcRocketLauncher', Pawn);
+	if (Fresh == None)
+		return;
+
+	// The ammo lives in its own inventory actor (LauncherAmmoInv); share it rather
+	// than create a second. GiveTo does not add ammo, so nothing is duplicated.
+	Fresh.AmmoType = Old.AmmoType;
+	Fresh.GiveTo(Pawn);
+
+	// If they were holding the old one, change over through the engine's own
+	// switch path BEFORE the old weapon goes away, so the pawn is never left
+	// pointing at something that is about to be destroyed.
+	if (Pawn.Weapon == Old)
+	{
+		Pawn.PendingWeapon = Fresh;
+		Pawn.ChangedWeapon();
+	}
+
+	// Destroy unlinks itself from the inventory chain (Inventory.Destroyed) and
+	// tears down its third-person actor.
+	Old.Destroy();
+
+	if (bShowMoveDebug)
+		ClientMessage("Quake launcher: converted the stock rocket launcher.");
+}
+
+// --- Enhanced-mode flying shovel -----------------------------------------
+//
+// P2's ShovelWeapon.GoFlying (Inventory/ShovelWeapon.uc:172) is the "flying
+// shovel": an airborne swing in Enhanced mode throws you. Its second line is
+//     if (Instigator.Physics != PHYS_Falling) return;
+// and the movement port holds the pawn on PHYS_None the whole time it owns it,
+// so the throw can never fire here -- the shovel swings, the animation plays and
+// nothing happens. We cannot edit ShovelWeapon, but the swing reaches back to us
+// once, before GoFlying: ShovelWeapon.DoHit calls Instigator.AdjustAim, and
+// Engine.Pawn.AdjustAim forwards straight to Controller.AdjustAim (Pawn.uc:602).
+// That is the hook. We reimplement GoFlying's throw on the simulation's velocity,
+// with the same aim (and the same constants) the swing is about to use.
+//
+// The one thing we cannot copy is GoFlying's "don't fly if the swing hit a living
+// pawn" rule: AdjustAim runs before the trace that would decide it. The throw is
+// applied either way, so shovelling an enemy in mid-air also flings you.
+
+const SHOVEL_FLY_MAGNITUDE = 1000.0;   // ShovelWeapon FLY_MAGNITUDE
+const SHOVEL_FLY_CEILING   = 2000.0;   // ...CEILING
+const SHOVEL_FLY_MAXSPEED  = 1500.0;   // ...MAX_AIRSPEED
+
+function rotator AdjustAim(Ammunition FiredAmmunition, vector projStart, int aimerror)
+{
+	local rotator Aim;
+
+	Aim = Super.AdjustAim(FiredAmmunition, projStart, aimerror);
+
+	DriveFlyingShovel(Aim, projStart);
+
+	return Aim;
+}
+
+final function DriveFlyingShovel(rotator Aim, vector StartTrace)
+{
+	local ShovelWeapon Sh;
+	local vector VelAdd, GroundTest;
+
+	if (Pawn == None || Move == None || !bGoldSrcMovement || !bMoveInitialized)
+		return;
+
+	// GoFlying's own gate: the plain shovel only, not its subclasses.
+	Sh = ShovelWeapon(Pawn.Weapon);
+	if (Sh == None || Sh.Class != class'ShovelWeapon')
+		return;
+
+	// Enhanced mode, or the shovel does not fly in P2 either.
+	if (P2GameInfoSingle(Level.Game) == None
+		|| !P2GameInfoSingle(Level.Game).VerifySeqTime())
+		return;
+
+	// GoFlying's other gate: already airborne. The simulation, not the pawn's
+	// PHYS_None physics, is the authority on whether we are.
+	if (Move.onground)
+		return;
+
+	// Stabbing (alt-fire) throws you straight up; swinging throws you back the way
+	// you are looking. GoFlying reads the same flag off the weapon.
+	if (Sh.bAltFiring)
+		VelAdd = vect(0,0,1);
+	else
+		VelAdd = -Normal(vector(Aim));
+
+	VelAdd *= SHOVEL_FLY_MAGNITUDE;
+
+	Move.velocity += VelAdd;
+
+	// Per-axis airspeed cap, then the anti-climb rule, both exactly as GoFlying
+	// has them. FastTrace reads TRUE only when the ground is MORE than CEILING
+	// below (the trace reaches its end without hitting), which is the "too high off
+	// the ground" the original is guarding against.
+	Move.velocity.X = FClamp(Move.velocity.X, -SHOVEL_FLY_MAXSPEED, SHOVEL_FLY_MAXSPEED);
+	Move.velocity.Y = FClamp(Move.velocity.Y, -SHOVEL_FLY_MAXSPEED, SHOVEL_FLY_MAXSPEED);
+	Move.velocity.Z = FClamp(Move.velocity.Z, -SHOVEL_FLY_MAXSPEED, SHOVEL_FLY_MAXSPEED);
+
+	GroundTest = StartTrace;
+	GroundTest.Z -= SHOVEL_FLY_CEILING;
+
+	if (FastTrace(GroundTest, StartTrace))
+		Move.velocity.Z = FMin(Move.velocity.Z, 0.0);
+
+	Move.PM_CheckVelocity();
+
+	Pawn.Velocity = Move.velocity;
 }
 
 // Console commands
@@ -1383,6 +1783,32 @@ exec function Speedo(optional string OnOff)
 
 	SaveConfig();
 	ClientMessage("Speedometer:" @ OnOffStr(bShowSpeedometer));
+}
+
+// speedox / speedoy: slide the speedometer (and the velocity graph that sits with
+// it) around the screen. The numbers are pixel offsets added to the stock
+// centre-bottom anchor, so 0,0 is where it has always been, positive X moves it
+// right and positive Y moves it down.
+exec function speedox(optional string Value)
+{
+	if (Value != "")
+	{
+		SpeedoOffX = float(Value);
+		SaveConfig();
+	}
+
+	ClientMessage("speedox" @ int(SpeedoOffX) @ "(pixels; default 0)");
+}
+
+exec function speedoy(optional string Value)
+{
+	if (Value != "")
+	{
+		SpeedoOffY = float(Value);
+		SaveConfig();
+	}
+
+	ClientMessage("speedoy" @ int(SpeedoOffY) @ "(pixels; default 0)");
 }
 
 exec function MoveDebug(optional string OnOff)
@@ -2443,6 +2869,23 @@ ignores SeePlayer, HearNoise, Bump;
 		Move.viewRight   = Y;
 		Move.viewUp      = Z;
 
+		// Noclip's 3D wish direction: Source's noclip flies along the view
+		// basis (pitch included), W/S on the forward axis, A/D on the right
+		// one, no diagonal clamp -- a straight sum, normalised.
+		if (Move.bNoclip)
+		{
+			Move.noclipWishDir = vect(0,0,0);
+
+			if (aForward != 0 || aStrafe != 0)
+			{
+				Move.noclipWishDir = X * (aForward / FMax(1.0, MoveAxisMax))
+				                   + Y * (aStrafe  / FMax(1.0, MoveAxisMax));
+				Move.noclipWishDir = Normal(Move.noclipWishDir);
+			}
+
+			Move.noclipWishSpeed = Move.sv_noclipspeed;
+		}
+
 		// Map Unreal's input axes onto HL's +-400 forwardmove / sidemove --
 		// IN SIMULATION UNITS.
 		MoveScale = Move.HL_MAX_MOVE_CMD * Move.WorldScale
@@ -2514,6 +2957,34 @@ ignores SeePlayer, HearNoise, Bump;
 		// knows, that early in the frame, whether we are on the ground.
 		Move.buttonDuckTap = (bDuckTap != 0) || bDuckTapHeld;
 
+		// Edgebug bind, hold state only, and only with the mode on. The sim hunts
+		// for the ledge while this is true; see PM_Edgebug.
+		//
+		// Two kinds of hold, and only one of them may be retired by silence:
+		//
+		// ADOPTED (EdgebugHoldKey != 0): the console named the key and its
+		// RELEASE has not arrived. The key is physically down -- no heartbeat
+		// is needed and none may override it. Retiring this on exec silence
+		// was the "hold works or it doesn't" bug: the engine does not reliably
+		// re-fire a held key's binding, so after one second of no repeats the
+		// hold was dropped mid-press, and the assist went dead for the rest
+		// of a long hold. A tap kept working (its ~1s linger window covered
+		// the edge), which is exactly how it read in game.
+		//
+		// HEARTBEAT (no key adopted): the exec latched itself with no key to
+		// watch. This one IS retired by silence, because nothing else would
+		// ever end it.
+		if (EdgebugHoldKey != 0)
+		{
+			bEdgebugHeld = true;
+		}
+		else if (bEdgebugHeld && EdgebugExecTime < Level.TimeSeconds - 1.0)
+		{
+			bEdgebugHeld = false;
+		}
+
+		Move.buttonEdgebug = bEdgebugMode && (bEdgebugHeld || EdgebugHoldKey != 0);
+
 		// --- Ladders ------------------------------------------------------
 		// Resolve the ladder plane from POSTAL 2's LadderVolume and hand it to
 		// the sim, which then runs Valve's PM_LadderMove math on it.
@@ -2521,6 +2992,31 @@ ignores SeePlayer, HearNoise, Bump;
 
 		// --- Run one GoldSrc movement frame -----------------------------
 		Move.PM_PlayerMove();
+
+		// The sim found a viable edge this frame: say so, once. Printed here
+		// rather than in the sim so it lands after the move it describes.
+		if (Move.bEdgebugPendingMsg)
+		{
+			Move.bEdgebugPendingMsg = false;
+			ClientMessage("[EBv1] Found viable edge at"
+				@ int(Move.EdgebugPos.X) @ int(Move.EdgebugPos.Y) @ int(Move.EdgebugPos.Z)
+				@ "-- edgebugging.");
+		}
+
+		// Live hunt diagnostics, throttled to once a second so the console is
+		// not spammed at frame rate.
+		if (Move.bEdgebugDebug)
+		{
+			if (EdgebugDebugMsgTime != Level.TimeSeconds)
+			{
+				EdgebugDebugMsgTime = Level.TimeSeconds;
+				if (Move.EdgebugDebugHits > 0)
+					ClientMessage("[EB]" @ Move.EdgebugDebugState
+						@ "(" $ Move.EdgebugDebugHits $ "/9)");
+				else
+					ClientMessage("[EB]" @ Move.EdgebugDebugState);
+			}
+		}
 
 		// --- Write results back -----------------------------------------
 		// PM_Duck / PM_UnDuck have ALREADY offset Move.origin by the hull delta, so no
@@ -2986,6 +3482,14 @@ function PlayerTick(float DeltaTime)
 	// HoldPhysNone for the base-loss route that keeps taking it.
 	if (bGoldSrcMovement && GetStateName() == 'PlayerGoldSrcWalking')
 		HoldPhysNone();
+
+	// Keep any stock launcher the player has been handed converted to the Quake
+	// one. Throttled, and a no-op once converted (see ConvertStockLauncher).
+	if (bQuakeGun && Pawn != None && Level.TimeSeconds >= NextLauncherSweep)
+	{
+		NextLauncherSweep = Level.TimeSeconds + 0.5;
+		ConvertStockLauncher();
+	}
 }
 
 // The stock movement states we take back, tested by EXACT name (see the
@@ -3013,6 +3517,8 @@ defaultproperties
 {
 	bGoldSrcMovement=true
 	bShowSpeedometer=true
+	SpeedoOffX=0.0
+	SpeedoOffY=0.0
 	bShowMoveDebug=false
 	bShowNetGraph=false
 	bShowPos=false
@@ -3022,6 +3528,8 @@ defaultproperties
 	ViewModelSwayScale=1.0
 	bViewModelSwayPitch=true
 	bForceDualWield=false
+	bQuakeRockets=false
+	bQuakeGun=true
 	ViewRollAngle=0.65          // Half-Life's own cl_rollangle
 	ViewRollSpeed=300.0         // Half-Life's own cl_rollspeed
 	bGoldSrcFootSteps=true

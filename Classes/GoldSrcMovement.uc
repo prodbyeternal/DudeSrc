@@ -222,6 +222,40 @@ var bool        buttonDuckTap;      // ducktap bind held this frame
 var bool        ducktapOnce;        // one-shot request from the ducktap command
 var bool        ducktapPressed;     // press issued; release it next frame
 
+// Edgebug ("EBv1", mint's +mint_edgebug ported). Like sv_autobunnyhop this is a
+// bind-driven assist, not pm_shared.c code: while the bind is held and we are
+// falling, each frame sweeps the hull along the frame's own move and straight
+// down under itself; the frame a LIP comes into reach and the edge scan
+// confirms a real edge, the fall is killed AT the lip -- one bounce, mint's
+// edgebug clip -- and that is all. There is no surf state afterwards: the
+// assist is stateless, the very next frame is pure engine physics again, so
+// we slide off the edge (or touch down on it) under gravity's own regular
+// rate. The bind itself lives on GoldSrcPlayer.
+var bool        buttonEdgebug;      // edgebug bind held this frame
+var vector      EdgebugPos;         // the lip the catch braked us at (engine units)
+var bool        bEdgebugPendingMsg; // sim caught an edge; controller prints it
+var float       EdgebugLastCatchTime;// Level.TimeSeconds of the last catch, for
+                                    //   the short re-catch cooldown
+
+// Diagnostics for the edgebug hunt, printed on screen by the controller when
+// sv_edgebug_debug is on. Everything the detection can fail on, in one readout.
+var bool        bEdgebugDebug;      // sv_edgebug_debug 1 -- print hunt state
+var string      EdgebugDebugState;  // one-line summary of the last hunt frame
+var int         EdgebugDebugHits;   // floor probes that hit, of 5, last scan
+var vector      EdgebugDebugPos;    // the sweep/probe point, floor level
+
+// Source's noclip speed, in HL units, doubled on use like every length here.
+var config float sv_noclipspeed;
+
+// Source-style noclip (sv_cheats 1; noclip). While on, the frame is a pure
+// fly: move along the VIEW direction (pitch included, the way Source does it)
+// at sv_noclipspeed with no collision and no gravity. Owned here, like the
+// edgebug, so the whole frame stays one pipeline; the controller just latches
+// the toggle and hands us wish direction and wish speed.
+var bool        bNoclip;            // noclip toggle latched by the exec
+var vector      noclipWishDir;      // full 3D view-space wish direction
+var float       noclipWishSpeed;    // sv_noclipspeed (engine units/sec)
+
 var float       frametime;          // pmove->frametime (seconds)
 var float       friction;           // pmove->friction (entity friction, 1.0)
 var float       gravityScale;       // pmove->gravity (entity gravity, 1.0)
@@ -299,6 +333,12 @@ var config float sv_knockback;
 
 // Scale on EXPLOSIVE knockback (GoldSrcPlayer.DamageKnockback).
 var config float sv_explosionknockback;
+
+// Extra multiplier, on top of sv_explosionknockback, applied only to a blast the
+// PLAYER set off themselves -- a rocket or a grenade at their own feet -- so
+// self-blast jumps go higher. Enemy blasts and the damage done to enemies are
+// untouched. See GoldSrcPlayer.DriveDamage.
+var config float sv_rocketjumpboost;
 
 // Ceiling on the velocity one frame of damage may add, in P2 units per second.
 var config float sv_maxdamagepush;
@@ -2153,7 +2193,316 @@ final function PM_UpdateStepSound()
 	}
 }
 
-// PM_CheckFalling    (pm_shared.c:2679)
+// PM_NoclipMove -- Source's noclip: fly along the view direction at a fixed
+// speed, no collision, no gravity. The controller supplies the 3D wish
+// direction (view basis, pitch included) and the toggle; we just integrate.
+// Nothing about GoldSrc applies here -- no friction, no ground, no fall.
+final function PM_NoclipMove()
+{
+	// Wish speed is a scalar; the direction is already normalised.
+	origin += noclipWishDir * noclipWishSpeed * frametime;
+
+	// Zero velocity so nothing (fall damage, knockback residue, the speedometer's
+	// fall tracking) inherits a fly speed when noclip ends.
+	velocity         = vect(0,0,0);
+	flFallVelocity   = 0.0;
+
+	// Off the ground by definition.
+	onground     = false;
+	groundEntity = None;
+
+	DebugMoveState = "Noclip";
+}
+
+// Edgebug ("EBv1", mint's +mint_edgebug ported). Not in pm_shared.c: like
+// sv_autobunnyhop it is a player convenience layered on top of the simulation
+// (mint's +mint_edgebug is the reference). While the bind is held and we are
+// falling, each frame sweeps the hull along that frame's own move and straight
+// down under itself -- so edges catch whichever way we are moving or looking.
+// The frame a sweep finds a lip whose hit point is only PARTIALLY over solid
+// ground (a triple-radius eight-point scan: some floor, some open -- a ledge
+// lip and not a plain floor), the fall is killed AT the lip the way a real
+// edgebug clips it: a bounce. Horizontal speed skims us across the edge, and
+// gravity rebuilds the fall at its regular rate only once the edge is behind
+// us. On a staircase this chains -- every lip clipped, no fall ever banked.
+final function PM_Edgebug()
+{
+	local vector TraceEnd, ScanStart, ScanEnd, Off, HitLoc, HitNorm;
+	local vector SweepPos, ProbeHit, ProbeNorm;
+	local Actor  HitActor;
+	local float  Radius, ProbeDepth;
+	local int    FloorHits, i, Scan;
+	local bool   NearEdge, bSweptFloor;
+
+	if (!buttonEdgebug)
+	{
+		if (bEdgebugDebug) EdgebugDebugState = "bind off";
+		return;
+	}
+
+	// Touched down -- even a genuine edgebug ends the moment the ground has us.
+	// The cooldown clears with it (mint does the same): this is what chains
+	// edgebugs down a staircase -- catch, touch the step, cooldown reset, the
+	// next step's lip catches the instant we fall off this one.
+	if (onground)
+	{
+		EdgebugLastCatchTime = 0.0;
+		if (bEdgebugDebug) EdgebugDebugState = "onground";
+		return;
+	}
+
+	// No assist underwater: pool bottoms have edges too, and sinking onto
+	// one is not a bug worth faking.
+	if (waterlevel > 0)
+	{
+		if (bEdgebugDebug) EdgebugDebugState = "in water";
+		return;
+	}
+
+	// Only hunt while falling.
+	if (velocity.Z >= 0.0)
+	{
+		if (bEdgebugDebug) EdgebugDebugState = "not falling (vz" $ int(velocity.Z) $ ")";
+		return;
+	}
+
+	// --- THE HUNT -----------------------------------------------------------
+	// Direct, per frame: sweep the hull along THIS frame's actual move and
+	// straight down under where we are. The frame a lip comes into reach is
+	// the frame of the catch -- there is no lock, no lookahead, no predicted
+	// crossing frame to go stale when we steer. The old design locked up to
+	// 3.5 ticks ahead and re-verified at a predicted crossing; every part of
+	// that could drift between hunt and contact, which is a whole family of
+	// "it didn't fire / it fired wrong" in one mechanism. Here, if the sweep
+	// says the lip is in this frame's path, it is -- the same trace the move
+	// itself is about to run.
+	TraceEnd = origin + velocity * frametime;
+
+	PM_PlayerTrace(origin, TraceEnd);
+
+	// PM_PlayerTrace reports where the hull CENTRE stops, which sits a
+	// half-height above the floor it hit; drop SweepPos to FLOOR level so the
+	// scan probes and the step-rejection test measure against the surface.
+	bSweptFloor = (TraceFraction < 1.0 && TracePlaneNormal.Z > 0.4);
+	if (bSweptFloor)
+	{
+		SweepPos = TraceEndPos;
+		SweepPos.Z -= HullHalfHeight() - PM_TRACE_EPSILON * WorldScale;
+	}
+
+	// Fallback #1: a fast horizontal crossing can carry the sweep PAST the lip
+	// (the path is shallow, the lip is below-behind it). Sweep the hull
+	// straight down from where this frame ends -- one frame's fall plus a
+	// short margin, no more: a bounce has to fire AT the lip to read as an
+	// edgebug, not a few dozen units above it.
+	if (!bSweptFloor)
+	{
+		ProbeDepth = -velocity.Z * frametime + 4.0 * WorldScale;
+
+		TraceCount++;
+		HitActor = TraceOwner.Trace(ProbeHit, ProbeNorm, TraceEnd
+			- vect(0,0,1) * ProbeDepth, TraceEnd, true, HullExtent());
+
+		if (BlocksPlayer(HitActor) && ProbeNorm.Z > 0.4)
+		{
+			// Extent traces report the hull CENTRE at impact; drop to floor.
+			bSweptFloor = true;
+			SweepPos    = ProbeHit;
+			SweepPos.Z -= HullHalfHeight();
+		}
+	}
+
+	// Fallback #2: direction-agnostic. The edge can have nothing to do with
+	// where we are headed -- strafed sideways off a ledge, backed off one,
+	// falling past the lip of a step we never aimed at, not "looking" at the
+	// edge at all. This is a fake, not 1:1 source physics, and a fake gets
+	// to be forgiving: any lip under the hull RIGHT NOW is a candidate,
+	// whichever way we came from. Sweep the hull straight down from where we
+	// actually are, to the same close depth.
+	if (!bSweptFloor)
+	{
+		ProbeDepth = -velocity.Z * frametime + 4.0 * WorldScale;
+
+		TraceCount++;
+		HitActor = TraceOwner.Trace(ProbeHit, ProbeNorm, origin
+			- vect(0,0,1) * ProbeDepth, origin, true, HullExtent());
+
+		if (BlocksPlayer(HitActor) && ProbeNorm.Z > 0.4)
+		{
+			bSweptFloor = true;
+			SweepPos    = ProbeHit;
+			SweepPos.Z -= HullHalfHeight();
+		}
+	}
+
+	if (!bSweptFloor)
+	{
+		if (bEdgebugDebug)
+		{
+			EdgebugDebugPos = TraceEnd;
+			EdgebugDebugState = "no floor in reach";
+		}
+		return;
+	}
+
+	if (bEdgebugDebug)
+	{
+		EdgebugDebugPos = SweepPos;
+		EdgebugDebugState = "floor at" @ int(SweepPos.X) @ int(SweepPos.Y) @ int(SweepPos.Z);
+	}
+
+	// Triple-radius scan around the sweep point. A hit point is an EDGE when
+	// some but not all of the ring probes find floor -- one side of it is
+	// open. Three radii, three jobs:
+	//   20*WS -- mint's own, world geometry ledges;
+	//    7*WS -- narrow props, crate tops, beams;
+	//   48*WS -- deep stair steps. A landing in the middle of a step deeper
+	//            than the first radius can reach reads as "full floor" and
+	//            never fires, which is exactly the staircase that "didn't
+	//            work". The wide ring still finds the step's lip.
+	//
+	// EIGHT directions, not four: cardinals alone go blind to an edge line
+	// running diagonally under us -- the lip can sit beyond the ring in both
+	// axis directions yet only a step away diagonally, every cardinal reads
+	// floor, and a real edge reads as a plain floor. The diagonals close
+	// that hole.
+	for (Scan = 0; Scan < 3 && !NearEdge; Scan++)
+	{
+		if (Scan == 0)
+			Radius = 20.0 * WorldScale;
+		else if (Scan == 1)
+			Radius = 7.0 * WorldScale;
+		else
+			Radius = 48.0 * WorldScale;
+		FloorHits = 0;
+
+		// The centre: floor directly under the sweep point. It COUNTS toward
+		// the verdict but is not REQUIRED -- the classic edgebug geometry has
+		// the hull's edge clipping the lip while the hull CENTRE is already
+		// past it, over open air. Requiring centre floor rejected exactly the
+		// near-edge clips this assist exists for. The guarantee that the
+		// floor is genuinely in our path comes from somewhere better: the
+		// sweep or down-probe that produced SweepPos swept the HULL, not a
+		// point.
+		ScanStart = SweepPos;
+		ScanStart.Z += 20.0 * WorldScale;
+		ScanEnd   = ScanStart;
+		ScanEnd.Z -= 40.0 * WorldScale;
+
+		TraceCount++;
+		HitActor = TraceOwner.Trace(HitLoc, HitNorm, ScanEnd, ScanStart, true, vect(0,0,0));
+
+		if (BlocksPlayer(HitActor) && HitNorm.Z > 0.6
+			&& Abs(HitLoc.Z - SweepPos.Z) <= 4.0 * WorldScale)
+		{
+			FloorHits++;
+		}
+
+		for (i = 0; i < 8; i++)
+		{
+			switch (i)
+			{
+				case 0: Off = vect( 1, 0, 0) * Radius; break;
+				case 1: Off = vect(-1, 0, 0) * Radius; break;
+				case 2: Off = vect( 0, 1, 0) * Radius; break;
+				case 3: Off = vect( 0,-1, 0) * Radius; break;
+				// The diagonals, pulled in to the same ring distance.
+				case 4: Off = vect( 1, 1, 0) * Radius * 0.7071; break;
+				case 5: Off = vect( 1,-1, 0) * Radius * 0.7071; break;
+				case 6: Off = vect(-1, 1, 0) * Radius * 0.7071; break;
+				case 7: Off = vect(-1,-1, 0) * Radius * 0.7071; break;
+			}
+
+			ScanStart = SweepPos + Off;
+			ScanStart.Z += 20.0 * WorldScale;
+			ScanEnd   = ScanStart;
+			ScanEnd.Z -= 40.0 * WorldScale;
+
+			TraceCount++;
+			HitActor = TraceOwner.Trace(HitLoc, HitNorm, ScanEnd, ScanStart, true, vect(0,0,0));
+
+			// Point traces do not go through PM_PlayerTrace's filtering, so apply
+			// the same rule by hand: blocking geometry with a floor-normal counts.
+			if (BlocksPlayer(HitActor) && HitNorm.Z > 0.6)
+			{
+				// A step or a curb, not an edge drop-off: reject it. The
+				// tolerance is a little looser than mint's 2.5 so bumpy,
+				// cobbled and gravel floors do not read as pure air -- a
+				// stair step is 64 units away vertically, far outside it.
+				if (Abs(HitLoc.Z - SweepPos.Z) <= 4.0 * WorldScale)
+					FloorHits++;
+			}
+		}
+
+		// The verdict, mint's own rule: SOME floor, SOME open. At least one
+		// of the nine probes finds floor at lip height (there is an edge
+		// here to bug off), and at least one is open (it is an edge and not
+		// a plain floor). Which probe hits does not matter -- centre, ring,
+		// cardinal, diagonal: an edge line in ANY orientation under the
+		// sweep point shows up as partial support.
+		if (bEdgebugDebug)
+		{
+			EdgebugDebugHits = FloorHits;
+			if (FloorHits == 0 && NearEdge == false)
+				EdgebugDebugState = EdgebugDebugState $ ", scan: all open";
+			else if (FloorHits == 9)
+				EdgebugDebugState = EdgebugDebugState $ ", scan: full floor";
+		}
+
+		if (FloorHits >= 1 && FloorHits <= 8)
+			NearEdge = true;
+	}
+
+	if (!NearEdge)
+		return;
+
+	// Re-catch cooldown. With no surf state this has one job: stop the SAME
+	// lip bouncing us twice. The catch fires a little above the lip (the
+	// down-probes see one frame's fall plus a short margin ahead); after the
+	// bounce, gravity rebuilds the fall from zero and carries us the rest of
+	// the way down onto the lip -- that descent takes under 0.2s, and while
+	// it lasts the cooldown must hold or the hunt would catch the lip we are
+	// already falling onto and kill the fall again, a hover in tiny steps.
+	// Touching the lip ends it the honest way (onground resets the
+	// cooldown). The cooldown ALSO has to stay short enough to chain a
+	// staircase -- lip to lip is a regular fall of one step height, ~0.3s --
+	// so 0.2 sits between the two.
+	if (TraceOwner != None
+		&& EdgebugLastCatchTime > 0.0
+		&& TraceOwner.Level.TimeSeconds - EdgebugLastCatchTime < 0.2)
+		return;
+
+	if (TraceOwner != None)
+		EdgebugLastCatchTime = TraceOwner.Level.TimeSeconds;
+
+	// --- THE CATCH: THE BOUNCE -----------------------------------------------
+	// The lip is within this frame's reach and the scan says it is a real
+	// edge. What a real edgebug does is CLIP the fall against the edge --
+	// the vertical velocity dies there, horizontal speed carries you across,
+	// and gravity only starts rebuilding the fall once the edge is behind
+	// you. So: kill the fall HERE, at the lip (this is exactly what
+	// PM_AddCorrectGravity subtracts in a moment, so this frame's position
+	// integrates at zero vertical speed) -- and then NOTHING more. No surf
+	// state, no held assist: the very next frame is untouched engine
+	// physics. We slide off the edge and the fall rebuilds at gravity's own
+	// regular rate, or we touch down on the lip, quietly, and walk off.
+	// No verification pass is needed -- the sweep that found this floor IS
+	// the move this frame is about to make.
+	bEdgebugPendingMsg = true;
+	EdgebugPos         = SweepPos;
+
+	if (gravityScale != 0.0)
+		velocity.Z = gravityScale * sv_gravity * 0.5 * frametime;
+	else
+		velocity.Z = sv_gravity * 0.5 * frametime;
+
+	// The fall is broken as far as the landing code is concerned too --
+	// whatever the bounce leaves us touching down on, it touches down
+	// silently.
+	flFallVelocity = 0.0;
+}
+
+// PM_CheckFalling
 final function PM_CheckFalling()
 {
 	local float HLFallVel, fvol;
@@ -2714,6 +3063,17 @@ final function PM_PlayerMove()
 		return;                         // Can't move, we're stuck
 	}
 
+	// Noclip short-circuits everything, the stuck check included: a nocliping
+	// player is allowed to be inside geometry, so PM_CheckStuck's "is this spot
+	// free" probe has nothing to say, and the nudge it would fire on a false
+	// positive would fight the fly. No gravity, no ground, no collision, no
+	// water, no touch dispatch -- just the fly itself.
+	if (bNoclip)
+	{
+		PM_NoclipMove();
+		return;
+	}
+
 	// Now that we are "unstuck", see where we are.
 	// (This calls PM_CheckWater() first, so waterlevel is live from here on.)
 	PM_CategorizePosition();
@@ -2721,6 +3081,14 @@ final function PM_PlayerMove()
 	// If we are not on ground, store off how fast we are moving down
 	if (!onground)
 		flFallVelocity = -velocity.Z;
+
+	// Edgebug assist. Runs before gravity and the move proper, so a lock found
+	// this frame takes effect on this frame's flight. Input is left alone:
+	// neutralising it for the whole descent fights the player's steering, and
+	// the catch itself is velocity.Z surgery, not a trajectory change -- only
+	// the moment of the pin needs still air, and it gets it by construction.
+	if (buttonEdgebug)
+		PM_Edgebug();
 
 	// Valve's ladder detection sits here, immediately above this call; ours ran on
 	// the controller before the frame started, so onladder is already good.
@@ -2899,7 +3267,8 @@ defaultproperties
 	// dimensionless coefficients are left alone.
 	sv_maxspeed=640.0           // HL 320
 	sv_accelerate=10.0          // HL 10   (dimensionless)
-	sv_airaccelerate=10.0       // HL 10   (dimensionless)
+	sv_airaccelerate=50.0       // CS-style air control (10 = stock HL). The mod's
+	                            // default: speedrun-friendly strafing.
 	sv_friction=4.0             // HL 4    (dimensionless)
 	sv_stopspeed=200.0          // HL 100
 	sv_gravity=1600.0           // HL 800
@@ -2927,13 +3296,20 @@ defaultproperties
 	sv_strictblocking=true      // world geometry needs the block flags too,
 	                            // which is the rule native movement uses
 
-	sv_falldamage=2             // 0 off, 1 flat 10 HP, 2 HL's height curve
+	sv_falldamage=0             // 0 off, 1 flat 10 HP, 2 HL's height curve. Off by
+	                            // default: the mod is speedrun-oriented and its
+	                            // edgebug/bhop assists assume no-falldamage play.
 
 	sv_knockback=1.0            // non-explosive hit knockback scale
 	sv_explosionknockback=0.5   // explosive knockback scale -- the damage boost,
 	                            // halved so a blast shoves instead of flinging
+	sv_rocketjumpboost=1.35     // extra kick on the player's OWN blast, so blast
+	                            // jumps go a little higher (1.0 = none)
 	sv_maxdamagepush=1000.0     // HL 500 ups: most one frame of damage may add
 	                            // in total, however many hits it arrives in
+
+	sv_noclipspeed=2000.0       // Source's noclip speed is 1000 HL ups (sv_noclipspeed
+	                            // in HL2; scaled here like every other length)
 
 	friction=1.0
 	gravityScale=1.0

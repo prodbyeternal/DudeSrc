@@ -7,6 +7,7 @@ class GoldSrcConsole extends FPSConsoleExt
 var config bool bEnabled;
 var config bool bPatchGameDefaults;   // job 1
 var config bool bWheelDuckFix;        // job 2
+var config bool bInstantLauncher;     // hand out GoldSrcRocketLauncher, not LauncherWeapon
 var config bool bVerbose;
 
 
@@ -51,7 +52,10 @@ function Tick(float DeltaTime)
 		// level's controller, so end the hold rather than leave it stuck on.
 		GP = GoldSrcPlayer(PC);
 		if (GP != None)
+		{
 			GP.DuckTapHoldEnd();
+			GP.EdgebugHoldEnd();
+		}
 	}
 
 	// The console eats keys while it is open, so a hold that survives into typing
@@ -59,8 +63,13 @@ function Tick(float DeltaTime)
 	if (bTyping)
 	{
 		GP = GoldSrcPlayer(PC);
-		if (GP != None && GP.DuckTapHoldKey != 0)
-			GP.DuckTapHoldEnd();
+		if (GP != None)
+		{
+			if (GP.DuckTapHoldKey != 0)
+				GP.DuckTapHoldEnd();
+			if (GP.EdgebugHoldKey != 0)
+				GP.EdgebugHoldEnd();
+		}
 	}
 
 	if (!bDuckKeysValid)
@@ -93,8 +102,43 @@ final function PatchGameDefaults()
 	class'AWGameSPFinal'.default.PlayerControllerClassName = "GoldSrcMovement.GoldSrcPlayer";
 	class'AWGameSPFinal'.default.HUDType                   = "GoldSrcMovement.GoldSrcHUD";
 
+	// Paradise Lost ships its own game info class, whose default controller is
+	// PLGame.PLDudePlayer. It is not part of the SDK this mod compiles against,
+	// so it can only be named as a string here -- and if the package is absent
+	// (plain Postal 2) the load simply returns None and we move on. CreditsGameInfo
+	// is a separate subclass with its own defaults, so it has to be named too.
+	PatchGameInfoByName("PLGame.PLGameInfo");
+	PatchGameInfoByName("PLGame.TWPGameInfo");
+	PatchGameInfoByName("PLGame.CreditsGameInfo");
+
+	// Every launcher pickup in every map -- and Paradise Lost's weapon vending
+	// machine, which stocks the same pickup -- hands out this class, so the world
+	// launchers become the fast Quake one without touching a single map. Launchers
+	// a loadout or a cheat grants outright are caught by the sweep in GoldSrcPlayer.
+	if (bInstantLauncher)
+		class'LauncherPickup'.default.InventoryType = class'GoldSrcRocketLauncher';
+
 	if (bVerbose)
 		Log("GoldSrcConsole: patched game type defaults -> GoldSrcPlayer / GoldSrcHUD", 'GoldSrc');
+}
+
+// Point one game info class -- named by string, so it need not exist in the SDK --
+// at the mod's controller and HUD. These are class defaults, and the engine reads
+// them (GameInfo.uc:754) at Login, once per level, before any level script runs,
+// which is exactly why patching them here reaches a game info we cannot subclass.
+final function PatchGameInfoByName(string ClassName)
+{
+	local class<GameInfo> GIC;
+
+	GIC = class<GameInfo>(DynamicLoadObject(ClassName, class'Class', true));
+	if (GIC == None)
+		return;
+
+	GIC.default.PlayerControllerClassName = "GoldSrcMovement.GoldSrcPlayer";
+	GIC.default.HUDType                   = "GoldSrcMovement.GoldSrcHUD";
+
+	if (bVerbose)
+		Log("GoldSrcConsole: patched" @ ClassName @ "-> GoldSrcPlayer / GoldSrcHUD", 'GoldSrc');
 }
 
 // ask input system which keys are bound to duck and cache them for later use
@@ -169,6 +213,13 @@ function bool KeyEvent(EInputKey Key, EInputAction Action, FLOAT Delta)
 				GP.DuckTapHoldEnd();
 			}
 
+			// Same arrangement for the edgebug hold.
+			if (Action == IST_Release && GP.EdgebugHoldKey != 0
+				&& GP.EdgebugHoldKey == int(Key))
+			{
+				GP.EdgebugHoldEnd();
+			}
+
 			if (Action == IST_Press && !bTyping)
 			{
 				GP.DuckTapKeyInFlight     = int(Key);
@@ -182,6 +233,18 @@ function bool KeyEvent(EInputKey Key, EInputAction Action, FLOAT Delta)
 					GP.DuckTapHoldKey = int(Key);
 					GP.bDuckTapHeld   = true;
 				}
+
+				GP.EdgebugKeyInFlight     = int(Key);
+				GP.EdgebugKeyInFlightTime = GP.Level.TimeSeconds;
+
+				// The exec already ran this frame and found no key published, so it
+				// was dispatched ahead of us: this press is its key.
+				if (GP.EdgebugHoldKey == 0
+					&& GP.EdgebugExecTime == GP.Level.TimeSeconds)
+				{
+					GP.EdgebugHoldKey = int(Key);
+					GP.bEdgebugHeld   = true;
+				}
 			}
 		}
 	}
@@ -194,6 +257,7 @@ defaultproperties
 	bEnabled=true
 	bPatchGameDefaults=true
 	bWheelDuckFix=true
+	bInstantLauncher=true
 	bVerbose=false
 
 	bRequiresTick=True

@@ -520,10 +520,10 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 	UpdateAccel(M);
 
 	if (GP.bShowSpeedometer)
-		DrawSpeedometer(Canvas, M);
+		DrawSpeedometer(Canvas, M, GP.SpeedoOffX, GP.SpeedoOffY);
 
 	if (bShowVelocityGraph && GP.bShowSpeedometer)
-		DrawVelocityGraph(Canvas, M);
+		DrawVelocityGraph(Canvas, M, GP.SpeedoOffX, GP.SpeedoOffY);
 
 	if (GP.bShowMoveDebug)
 		DrawMoveDebug(Canvas, M);
@@ -1091,7 +1091,7 @@ simulated final function UpdateAccel(GoldSrcMovement M)
 
 // bunnymod xt users favourite feature. SHOUTOUT MY BOY YALTER
 
-simulated final function DrawSpeedometer(canvas Canvas, GoldSrcMovement M)
+simulated final function DrawSpeedometer(canvas Canvas, GoldSrcMovement M, float OffX, float OffY)
 {
 	local float Spd, BaseX, BaseY, XL, YL;
 	local string S;
@@ -1110,8 +1110,9 @@ simulated final function DrawSpeedometer(canvas Canvas, GoldSrcMovement M)
 
 	Canvas.StrLen(S, XL, YL);
 
-	BaseX = (Canvas.ClipX * 0.5) - (XL * 0.5);
-	BaseY = Canvas.ClipY - (Canvas.ClipY * 0.18);
+	// The player's speedox/speedoy offsets ride on top of the stock anchor.
+	BaseX = (Canvas.ClipX * 0.5) - (XL * 0.5) + OffX;
+	BaseY = Canvas.ClipY - (Canvas.ClipY * 0.18) + OffY;
 
 	// Drop shadow for legibility on bright scenery.
 	Canvas.SetDrawColor(0, 0, 0, 160);
@@ -1146,15 +1147,16 @@ simulated final function DrawSpeedometer(canvas Canvas, GoldSrcMovement M)
 
 // the velgraph
 
-simulated final function DrawVelocityGraph(canvas Canvas, GoldSrcMovement M)
+simulated final function DrawVelocityGraph(canvas Canvas, GoldSrcMovement M, float OffX, float OffY)
 {
 	local int   i, idx, Count;
 	local float GW, GH, GX, GY, BarW, Peak, V, H;
 
 	GW = 192.0;
 	GH = 48.0;
-	GX = (Canvas.ClipX * 0.5) - (GW * 0.5);
-	GY = Canvas.ClipY - (Canvas.ClipY * 0.18) - GH - 12;
+	// Rides with the speedometer, under the same speedox/speedoy offsets.
+	GX = (Canvas.ClipX * 0.5) - (GW * 0.5) + OffX;
+	GY = Canvas.ClipY - (Canvas.ClipY * 0.18) - GH - 12 + OffY;
 
 	if (bGraphFilled)
 		Count = GRAPH_SAMPLES;

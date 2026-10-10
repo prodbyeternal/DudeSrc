@@ -8,6 +8,8 @@ Then, run "ucc.exe make" to compile the mod, then drop the GoldSrcMovement.u fil
 
 # Installing
 
+## Postal 2
+
 Drop the GoldSourceMovement.u file into the System folder in your Postal 2 install, then open Postal2.ini and add
 the following lines.
 
@@ -18,6 +20,57 @@ Console=GoldSrcMovement.GoldSrcConsole
 ; line 109, [Engine.GameEngine] - after ServerActors=UWeb.WebServer
 ServerActors=GoldSrcMovement.GoldSrcInjector
 ```
+
+## Paradise Lost
+
+Paradise Lost is a separate install with its own System folder, but it already
+looks in the main game's System folder for packages (ParadiseLost.ini `Paths`
+includes `..\..\System\*.u`), so the same GoldSrcMovement.u covers it. Open
+`Paradise Lost\System\ParadiseLost.ini` and make the same two edits.
+
+```ini
+; [Engine.Engine] - change Console=FPSGame.FPSConsoleExt
+Console=GoldSrcMovement.GoldSrcConsole
+
+; [Engine.GameEngine] - after ServerActors=UWeb.WebServer
+ServerActors=GoldSrcMovement.GoldSrcInjector
+```
+
+Note that this replaces Paradise Lost's own player controller and HUD with the
+mod's, exactly as it does in the base game. Movement, weapons and the shovel all
+keep working, but Paradise Lost specific controller behaviour (notably the
+mounted weapon handling in PLDudePlayer) and its own HUD are traded away for
+GoldSrc movement.
+
+The `Console=` line is the one that actually does the work: the console patches
+the game type class defaults before the first level loads, and the engine reads
+those at Login. Paradise Lost ships `PLGame.PLGameInfo` instead of the base
+game's `AWPGameInfo`, so the mod names it (and `TWPGameInfo` / `CreditsGameInfo`)
+by string at runtime rather than referencing a class the SDK does not have.
+
+# Console commands
+
+```ini
+dudesrc_quakerockets [0/1]   ; your own rockets/explosions stop damaging you but still launch you
+dudesrc_quakegun [0/1]       ; Quake rocket launcher: instant straight rocket instead of P2's charged one
+sv_rocketjumpboost <mult>    ; extra launch on your OWN blasts (default 1.35, 1.0 = off)
+speedox <pixels>             ; slide the speedometer left/right (0 = stock position)
+speedoy <pixels>             ; slide the speedometer up/down (0 = stock position)
+```
+
+## Rocket launcher
+
+By default the rocket launcher is the Quake one: a tap fires a single fast, dead
+straight rocket, with no charging and no seeking rocket. This is on by default and
+applies to launchers found in maps, stocked by Paradise Lost's vending machine, and
+handed out by loadouts and cheats. `dudesrc_quakegun 0` puts the game's charged,
+seeking launcher back; `dudesrc_quakegun 1` restores the Quake one.
+
+Blast jumps are a touch stronger than the ordinary explosion knockback:
+`sv_rocketjumpboost` (default 1.35) multiplies the launch from a blast *you* set
+off -- a rocket or a grenade at your own feet -- and nothing else. Enemy blasts and
+the damage you deal to enemies are unaffected. Combine it with
+`dudesrc_quakerockets` to jump without hurting yourself.
 
 # Half Life 1 SDK LICENSE
 ======================
